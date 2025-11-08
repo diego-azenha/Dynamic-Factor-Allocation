@@ -269,12 +269,20 @@ def tune_hyperparams(far_df: pd.DataFrame,
     dates = features_df.index
     if len(dates) < lookback_train + validation_periods:
         raise ValueError("insufficient data for tuning")
-    start_val = lookback_train
-    end_val = lookback_train + validation_periods
+
+    total_combos = len(lambda_grid) * len(kappa_grid)
+    combo_count = 0
     best = {'sharpe': -np.inf, 'lambda': None, 'kappa': None}
     cols_all = features_df.columns.tolist()
+
     for lam in lambda_grid:
         for kap in kappa_grid:
+            combo_count += 1
+            start_msg = f"[Tune {factor_name}] ({combo_count}/{total_combos}) λ={lam}, κ={kap}"
+            print(start_msg, end="", flush=True)
+
+            start_val = lookback_train
+            end_val = lookback_train + validation_periods
             regimes = pd.Series(index=dates[start_val:end_val], dtype=float)
             i = start_val
             while i < end_val:
@@ -289,16 +297,21 @@ def tune_hyperparams(far_df: pd.DataFrame,
                     st = online_infer(Xf, fit['centroids'], fit['weights'], lambda_penalty=lam)
                     regimes.iloc[j - start_val] = st
                 i += refit_freq
+
             far = far_df[factor_name]
             regimes_full = pd.Series(index=dates, dtype=float)
             regimes_full.loc[dates[start_val:end_val]] = regimes.values
-            regimes_full = regimes_full.fillna(method='ffill').fillna(0).astype(int)
+            regimes_full = regimes_full.ffill().fillna(0).astype(int)
             sim = simulate_single_factor_strategy(far, regimes_full, cost_bps=cost_bps)
             sharpe = sim['sharpe']
-            if verbose:
-                print(f"tune {factor_name} lam={lam} kap={kap} sharpe={sharpe:.3f}")
+
+            end_msg = f" → Sharpe={sharpe:.3f}"
+            print(end_msg)
+
             if sharpe > best['sharpe']:
                 best = {'sharpe': sharpe, 'lambda': lam, 'kappa': kap}
+
+    print(f"[Tune {factor_name}] best λ={best['lambda']} κ={best['kappa']} Sharpe={best['sharpe']:.3f}")
     return best['lambda'], best['kappa']
 
 

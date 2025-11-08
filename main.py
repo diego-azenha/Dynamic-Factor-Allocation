@@ -3,6 +3,8 @@ import os
 import joblib
 from datetime import datetime
 from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
 import pandas as pd
@@ -97,12 +99,17 @@ def compute_metrics(returns_series):
 
 def pre_tune_all_factors(far_path, vix_path=None, t10y2y_path=None,
                          lambda_grid=None, kappa_grid=None,
-                         lookback_train=252 * 8, validation_periods=252 * 6, verbose=False):
+                         verbose=False):
     far = pd.read_csv(far_path, index_col=0, parse_dates=True)
     far.index = pd.to_datetime(far.index)
     far = far.sort_index()
     far_train = far.loc[:TRAIN_END]
     features = compute_features_from_active_returns(far_train, vix=None, t10y2y=None)
+
+    # ajustar janelas de treino e validação conforme dados disponíveis
+    lookback_train = 252 * 8
+    total_days = len(features)
+    validation_periods = min(252 * 6, max(252, total_days - lookback_train))
 
     tuned = {}
     lambda_grid = lambda_grid or [10.0, 25.0, 50.0, 100.0]
@@ -111,7 +118,7 @@ def pre_tune_all_factors(far_path, vix_path=None, t10y2y_path=None,
     factors = far_train.columns.tolist()
     os.makedirs("artifacts/sjm", exist_ok=True)
     for f in factors:
-        print(f"[PreTune] Tuning factor {f} using data up to {TRAIN_END} ...")
+        print(f"[PreTune] Tuning factor {f} usando dados até {TRAIN_END} ...")
         try:
             lam, kap = tune_hyperparams(far_train, features, f,
                                         lambda_grid, kappa_grid,
@@ -122,7 +129,7 @@ def pre_tune_all_factors(far_path, vix_path=None, t10y2y_path=None,
             tuned[f] = (lam, kap)
             print(f"[PreTune] {f} -> lambda={lam}, kappa={kap}")
         except Exception as e:
-            print(f"[PreTune] tuning failed for {f}: {e}; using defaults")
+            print(f"[PreTune] tuning failed for {f}: {e}; usando defaults")
             tuned[f] = (LAMBDA, KAPPA)
 
     joblib.dump(tuned, os.path.join("artifacts", "sjm", "tuned_params.joblib"))
@@ -147,11 +154,9 @@ def run_backtest():
     if PRETUNE:
         print("[Backtest] Running pre-tuning on training window (up to TRAIN_END)...")
         tuned_params = pre_tune_all_factors(FAR_PATH,
-                                           lambda_grid=[10, 25, 50, 100],
-                                           kappa_grid=[3, 6, 9.5, 12],
-                                           lookback_train=252 * 8,
-                                           validation_periods=252 * 6,
-                                           verbose=True)
+                                   lambda_grid=[10, 25, 50, 100],
+                                   kappa_grid=[3, 6, 9.5, 12],
+                                   verbose=True)
 
     rebalance_dates = [d for d in rebalance_dates if d >= pd.to_datetime(TEST_START)]
     if len(rebalance_dates) == 0:
