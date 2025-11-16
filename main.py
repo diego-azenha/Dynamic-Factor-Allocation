@@ -5,12 +5,89 @@ from datetime import datetime
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+import traceback
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sjm import run_sjm_pipeline, compute_features_from_active_returns, tune_hyperparams
+from sjm import run_sjm_pipeline
+
+import matplotlib.dates as mdates
+
+# --- plotting utility ---
+def plot_factor_with_regimes(factor_name: str,
+                             far_df: pd.DataFrame,
+                             states_series: pd.Series,
+                             window: tuple = None,
+                             save_path: str = None,
+                             figsize=(12, 4)):
+    """
+    Plota retornos do fator com regimes (0/1) preenchidos no fundo:
+    - far_df: DataFrame com retornos (index datetime)
+    - states_series: pd.Series (index datetime, values 0/1)
+    - window: (start, end) optional to zoom
+    - save_path: if provided, saves the plot
+    """
+    # usar retorno acumulado para visualização
+    returns = (1.0 + far_df[factor_name].fillna(0.0)).cumprod() - 1.0
+    returns = returns.dropna()
+
+    # Align states to returns index (causal reindex via ffill)
+    try:
+        states = states_series.reindex(returns.index, method='ffill').fillna(method='ffill').fillna(0).astype(int)
+    except Exception:
+        # fallback: create series from values if index mismatch
+        states = pd.Series(states_series.values, index=returns.index[:len(states_series)]).reindex(returns.index, method='ffill').fillna(0).astype(int)
+
+    if window is not None:
+        start, end = window
+        returns = returns.loc[start:end]
+        states = states.loc[start:end]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(returns.index, returns.values, lw=0.9, label=f"{factor_name} cumulative returns")
+
+    # Fill background by contiguous regime blocks
+    current_state = None
+    start_idx = None
+    idxs = states.index
+    vals = states.values
+    for i, dt in enumerate(idxs):
+        st = vals[i]
+        if current_state is None:
+            current_state = st
+            start_idx = dt
+            continue
+        if st != current_state:
+            end_idx = idxs[i - 1]
+            color = 'green' if current_state == 1 else 'red'
+            ax.axvspan(start_idx, end_idx, color=color, alpha=0.12, linewidth=0)
+            current_state = st
+            start_idx = dt
+    # final block
+    if start_idx is not None:
+        end_idx = idxs[-1]
+        color = 'green' if current_state == 1 else 'red'
+        ax.axvspan(start_idx, end_idx, color=color, alpha=0.12, linewidth=0)
+
+    ax.set_title(f"{factor_name} cumulative returns with regimes")
+    ax.set_ylabel("Cumulative return")
+    ax.set_xlabel("Date")
+    ax.grid(True)
+    ax.legend()
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    fig.autofmt_xdate()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+# --- end plotting utility ---
+
 
 DATA_FACTORS = "data_factors"
 FAR_PATH = os.path.join(DATA_FACTORS, "factor_active_returns.csv")
@@ -19,8 +96,8 @@ SP500_PATH = os.path.join("data", "SP500.csv")
 
 LOOKBACK_EXPANDING = True
 LOOKBACK_DAYS = None
-LAMBDA = 50.0
-KAPPA = 9.5
+LAMBDA = 50.0   # change manually as you like
+KAPPA = 9.5     # change manually as you like
 TAU = 0.025
 DELTA = 2.5
 TARGET_TE = 0.02
@@ -29,14 +106,15 @@ SAVE_ARTIFACTS_DIR = "artifacts/sjm"
 REBALANCE_FREQ = "M"
 EXECUTION_LAG_DAYS = 1
 
-PLOT_OUTPUT = "results_nav.png"
-TABLE_OUTPUT = "results_table.csv"
+# outputs saved under results/
+RESULTS_DIR = "results"
+PLOT_OUTPUT = os.path.join(RESULTS_DIR, "results_nav.png")
+TABLE_OUTPUT = os.path.join(RESULTS_DIR, "results_table.csv")
 
 # train / test split for your dataset (you requested validation to start in 2018)
 TRAIN_START = "2005-01-01"
 TRAIN_END = "2017-12-31"
 TEST_START = "2018-01-01"
-PRETUNE = False  # set to True to enable hyperparameter pre-tuning
 
 
 def load_returns():
@@ -97,48 +175,13 @@ def compute_metrics(returns_series):
     return {"cumulative_return": float(cum_ret), "ann_return": float(ann_ret), "ann_vol": float(ann_vol), "sharpe": float(sharpe)}
 
 
-def pre_tune_all_factors(far_path, vix_path=None, t10y2y_path=None,
-                         lambda_grid=None, kappa_grid=None,
-                         verbose=False):
-    far = pd.read_csv(far_path, index_col=0, parse_dates=True)
-    far.index = pd.to_datetime(far.index)
-    far = far.sort_index()
-    far_train = far.loc[:TRAIN_END]
-    features = compute_features_from_active_returns(far_train, vix=None, t10y2y=None)
-
-    # ajustar janelas de treino e validação conforme dados disponíveis
-    lookback_train = 252 * 8
-    total_days = len(features)
-    validation_periods = min(252 * 6, max(252, total_days - lookback_train))
-
-    tuned = {}
-    lambda_grid = lambda_grid or [10.0, 25.0, 50.0, 100.0]
-    kappa_grid = kappa_grid or [3.0, 6.0, 9.5, 12.0]
-
-    factors = far_train.columns.tolist()
-    os.makedirs("artifacts/sjm", exist_ok=True)
-    for f in factors:
-        print(f"[PreTune] Tuning factor {f} usando dados até {TRAIN_END} ...")
-        try:
-            lam, kap = tune_hyperparams(far_train, features, f,
-                                        lambda_grid, kappa_grid,
-                                        lookback_train=lookback_train,
-                                        validation_periods=validation_periods,
-                                        refit_freq=21,
-                                        verbose=verbose)
-            tuned[f] = (lam, kap)
-            print(f"[PreTune] {f} -> lambda={lam}, kappa={kap}")
-        except Exception as e:
-            print(f"[PreTune] tuning failed for {f}: {e}; usando defaults")
-            tuned[f] = (LAMBDA, KAPPA)
-
-    joblib.dump(tuned, os.path.join("artifacts", "sjm", "tuned_params.joblib"))
-    return tuned
-
-
 def run_backtest():
     start_time = datetime.now()
     print(f"[Backtest] Starting backtest at {start_time.isoformat()}")
+
+    # ensure results directory exists
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(os.path.join(RESULTS_DIR, "plots"), exist_ok=True)
 
     df_returns = load_returns()
     dates = df_returns.index
@@ -150,13 +193,8 @@ def run_backtest():
     if len(rebalance_dates) < 2:
         raise RuntimeError("Not enough rebalance dates found.")
 
+    # We removed PRETUNE entirely — tuned_params is always None and parameters are set manually via LAMBDA/KAPPA above
     tuned_params = None
-    if PRETUNE:
-        print("[Backtest] Running pre-tuning on training window (up to TRAIN_END)...")
-        tuned_params = pre_tune_all_factors(FAR_PATH,
-                                   lambda_grid=[10, 25, 50, 100],
-                                   kappa_grid=[3, 6, 9.5, 12],
-                                   verbose=True)
 
     rebalance_dates = [d for d in rebalance_dates if d >= pd.to_datetime(TEST_START)]
     if len(rebalance_dates) == 0:
@@ -165,6 +203,7 @@ def run_backtest():
     weights_by_date = {}
     last_weights = pd.Series(np.ones(len(benchmark_assets)) / len(benchmark_assets), index=benchmark_assets)
 
+    out = None
     for idx, rb in enumerate(rebalance_dates, 1):
         print(f"[Backtest] ({idx}/{len(rebalance_dates)}) Rebalance date: {rb.date()}")
         lookback = None if LOOKBACK_EXPANDING else LOOKBACK_DAYS
@@ -184,10 +223,14 @@ def run_backtest():
             target_te=TARGET_TE,
             save_artifacts=True,
             artifacts_dir=SAVE_ARTIFACTS_DIR,
-            verbose=False
+            verbose=True,
+            as_of_date=rb  # ensure no lookahead
         )
         t1 = datetime.now()
         print(f"[Backtest] SJM pipeline done in {(t1 - t0).total_seconds():.1f}s")
+
+        # --- plotting PER-REBALANCE removed to avoid many files ---
+        # --- end removed plotting block ---
 
         bl_inputs = out["bl_inputs"]
         from black_litterman import bl_pipeline
@@ -226,7 +269,7 @@ def run_backtest():
     bmk_w = pd.Series(np.ones(len(benchmark_assets)) / len(benchmark_assets), index=benchmark_assets)
     benchmark_daily = (df_returns[benchmark_assets] * bmk_w).sum(axis=1)
 
-        # NAVs
+    # NAVs
     nav_strat = (1.0 + strat_daily).cumprod()
     nav_bmk = (1.0 + benchmark_daily).cumprod()
 
@@ -263,6 +306,30 @@ def run_backtest():
     # salvar tabela
     results_table.to_csv(TABLE_OUTPUT)
     print(f"[Backtest] Saved results table: {TABLE_OUTPUT}")
+
+    # --- generate one full-period plot per factor using the last SJM fits (one image per factor) ---
+    try:
+        far_full = pd.read_csv(FAR_PATH, index_col=0, parse_dates=True)
+        far_full.index = pd.to_datetime(far_full.index)
+        fits = out.get("fits", {}) if out is not None else {}
+        os.makedirs(os.path.join(RESULTS_DIR, "plots"), exist_ok=True)
+        for factor_name, fit in fits.items():
+            states = fit.get("states", None)
+            if states is None:
+                # skip if no states returned for this factor
+                continue
+            # if states is not a pd.Series, try to align it to the tail of far_full index
+            if not isinstance(states, pd.Series):
+                try:
+                    states = pd.Series(states, index=far_full.index[-len(states):])
+                except Exception:
+                    continue
+            savep = os.path.join(RESULTS_DIR, "plots", f"{factor_name}_regimes_fullperiod.png")
+            plot_factor_with_regimes(factor_name, far_full, states, save_path=savep)
+        print(f"[Backtest] Saved full-period factor regime plots to: {os.path.join(RESULTS_DIR, 'plots')}")
+    except Exception as _e:
+        print(f"[Backtest] full-period plotting skipped/failed: {_e}")
+    # --- end full-period plotting ---
 
     end_time = datetime.now()
     print(f"[Backtest] Finished at {end_time.isoformat()} (elapsed {(end_time - start_time).total_seconds():.1f}s)")

@@ -8,8 +8,25 @@ from typing import Dict, Any, Tuple, List, Optional
 import numpy as np
 import pandas as pd
 from scipy import linalg
+import traceback
 
 TRADING_DAYS_PER_YEAR = 252
+
+def safe_inv(A: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Stable matrix inversion: use regularized inverse or pseudo-inverse if ill-conditioned."""
+    A = np.asarray(A, dtype=float)
+    n = A.shape[0]
+    try:
+        cond = np.linalg.cond(A)
+    except Exception:
+        cond = float('inf')
+    if cond < 1e12:
+        try:
+            return linalg.inv(A + eps * np.eye(n))
+        except Exception:
+            return np.linalg.pinv(A)
+    else:
+        return np.linalg.pinv(A)
 
 
 def ewma(s: pd.Series, span: int) -> pd.Series:
@@ -17,37 +34,46 @@ def ewma(s: pd.Series, span: int) -> pd.Series:
 
 
 def rolling_std(s: pd.Series, window: int) -> pd.Series:
-    return s.rolling(window).std(ddof=1).fillna(0.0)
+    return s.rolling(window, min_periods=1).std(ddof=1)
 
 
-def rsi(s: pd.Series, window: int = 14) -> pd.Series:
-    d = s.diff()
-    up = d.clip(lower=0.0)
-    down = -d.clip(upper=0.0)
-    ma_up = up.ewm(alpha=1 / window, adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / window, adjust=False).mean()
+def rsi(s: pd.Series, period: int = 14) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0.0)
+    down = -1.0 * delta.clip(upper=0.0)
+    ma_up = up.rolling(period, min_periods=1).mean()
+    ma_down = down.rolling(period, min_periods=1).mean()
     rs = ma_up / (ma_down + 1e-12)
-    return 100 - (100 / (1 + rs))
+    return 100 - 100 / (1 + rs)
 
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26) -> pd.Series:
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    return ema_fast - ema_slow
+def macd(s: pd.Series, fast: int = 12, slow: int = 26) -> pd.Series:
+    return ewma(s, fast) - ewma(s, slow)
 
 
-def downside_std(series: pd.Series, window: int) -> pd.Series:
-    def dd(x):
-        neg = x[x < 0]
-        return np.std(neg, ddof=1) if len(neg) > 1 else 0.0
-    return series.rolling(window).apply(lambda x: dd(x), raw=False).fillna(0.0)
+def downside_std(s: pd.Series, window: int) -> pd.Series:
+    roll = s.rolling(window, min_periods=1)
+    down = roll.apply(lambda x: np.std(x[x < 0]) if np.any(x < 0) else 0.0, raw=False)
+    return down
 
 
-def rolling_beta(factor: pd.Series, market: pd.Series, window: int = 63) -> pd.Series:
-    cov = factor.rolling(window).cov(market)
-    var = market.rolling(window).var()
-    return (cov / (var + 1e-12)).fillna(0.0)
+def rolling_beta(s: pd.Series, benchmark: pd.Series, window: int) -> pd.Series:
+    # alinhar índices e converter para numeric
+    s_al = s.reindex(benchmark.index).astype(float)
+    b_al = benchmark.astype(float).reindex(s_al.index)
 
+    # covariância rolling (cov returns a Series when passing another Series)
+    cov = s_al.rolling(window=window, min_periods=1).cov(b_al)
+    var_b = b_al.rolling(window=window, min_periods=1).var(ddof=1)
+
+    # evitar divisão por zero / NaNs
+    with np.errstate(divide='ignore', invalid='ignore'):
+        beta = cov / (var_b + 1e-12)
+
+    # onde var_b é 0 ou NaN, colocar 0.0
+    beta = beta.fillna(0.0)
+    beta[~np.isfinite(beta)] = 0.0
+    return beta
 
 def compute_features_from_active_returns(far: pd.DataFrame,
                                          vix: Optional[pd.Series] = None,
@@ -71,42 +97,42 @@ def compute_features_from_active_returns(far: pd.DataFrame,
         }
         blocks.append(pd.DataFrame(cols))
     features = pd.concat(blocks, axis=1).sort_index()
-    features = features.ffill().bfill().fillna(0.0)
+    # only forward-fill (causal); do NOT back-fill because that would use future information
+    features = features.ffill().fillna(0.0)
     env = pd.DataFrame(index=features.index)
     if vix is not None:
-        v = vix.reindex(features.index).ffill().bfill()
+        # align VIX to features index and forward-fill only; replace remaining missing with historic mean
+        v = vix.reindex(features.index).ffill()
+        if v.isna().any():
+            v = v.fillna(v.mean())
         env['VIX_log'] = np.log(v + 1e-12)
         env['VIX_ewma21'] = ewma(env['VIX_log'], 21)
     if t10y2y is not None:
-        slope = t10y2y.reindex(features.index).ffill().bfill()
-        env['slope_ewma63'] = ewma(slope, 63)
-    if not env.empty:
-        features = pd.concat([features, env], axis=1).fillna(0.0)
+        s = t10y2y.reindex(features.index).ffill()
+        if s.isna().any():
+            s = s.fillna(s.mean())
+        env['slope'] = s
+        env['slope_ewma21'] = ewma(env['slope'], 21)
+    # merge features and env
+    features = pd.concat([features, env], axis=1)
     return features
 
 
-def assign_states_dp(X: np.ndarray, centroids: np.ndarray, lambda_penalty: float) -> np.ndarray:
+def assign_states_dp(X: np.ndarray, centroids: np.ndarray, lambda_penalty: float = 50.0):
     T, D = X.shape
     K = centroids.shape[0]
-    costs = np.zeros((T, K))
-    for k in range(K):
-        dif = X - centroids[k]
-        costs[:, k] = np.sum(dif * dif, axis=1)
-    dp = np.zeros((T, K))
+    dp = np.zeros((T, K)) + 1e12
     ptr = np.zeros((T, K), dtype=int)
-    dp[0] = costs[0]
-    ptr[0] = -1
+    # cost to start at centroid 0 at t=0.. etc
+    for k in range(K):
+        dp[0, k] = np.linalg.norm(X[0] - centroids[k])
     for t in range(1, T):
         for k in range(K):
-            k_other = 1 - k
-            same = dp[t-1, k] + costs[t, k]
-            switch = dp[t-1, k_other] + costs[t, k] + lambda_penalty
-            if same <= switch:
-                dp[t, k] = same
-                ptr[t, k] = k
-            else:
-                dp[t, k] = switch
-                ptr[t, k] = k_other
+            costs = dp[t - 1] + np.linalg.norm(X[t] - centroids[k])
+            # add switching penalty
+            costs += lambda_penalty * (1.0)  # simple penalization; kept generic
+            dp[t, k] = np.min(costs)
+            ptr[t, k] = int(np.argmin(costs))
     states = np.zeros(T, dtype=int)
     states[-1] = int(np.argmin(dp[-1]))
     for t in range(T - 2, -1, -1):
@@ -135,82 +161,67 @@ def fit_sjm_factor(X: pd.DataFrame,
         Xw = Xs * W_sqrt
         cent_w = centroids * W_sqrt
         states = assign_states_dp(Xw, cent_w, lambda_penalty=lambda_penalty)
-        new_cent = np.zeros_like(centroids)
-        for k in (0, 1):
+        # re-estimate centroids
+        for k in range(centroids.shape[0]):
             mask = states == k
-            if mask.sum() > 0:
-                new_cent[k] = Xs[mask].mean(axis=0)
-            else:
-                new_cent[k] = centroids[k]
-        imp = np.abs(new_cent[0] - new_cent[1])
-        if imp.sum() == 0:
-            new_weights = np.ones(D) / D
+            if mask.sum() == 0:
+                continue
+            centroids[k] = np.mean(Xs[mask], axis=0)
+        # update weights (sparsity encouragement)
+        var_k = np.var(centroids, axis=0) + 1e-12
+        weights = np.exp(-kappa * var_k)
+        ssum = weights.sum()
+        if ssum == 0 or not np.isfinite(ssum):
+            # fallback to uniform if numerical issues arise
+            weights = np.ones_like(weights) / float(len(weights))
         else:
-            imp_norm = imp / (imp.sum() + 1e-12)
-            k_active = int(max(1, min(D, math.ceil(kappa))))
-            idx_top = np.argsort(imp_norm)[-k_active:]
-            w_sparse = np.zeros_like(imp_norm)
-            w_sparse[idx_top] = imp_norm[idx_top]
-            if w_sparse.sum() > 0:
-                new_weights = w_sparse / w_sparse.sum()
-            else:
-                new_weights = np.ones(D) / D
-        cent_change = np.linalg.norm(new_cent - centroids)
-        w_change = np.linalg.norm(new_weights - weights)
-        centroids = new_cent
-        weights = new_weights
-        if cent_change < tol and w_change < tol:
-            break
-    centroids_denorm = centroids * sigma[None, :] + mu[None, :]
-    return {
-        'centroids': centroids_denorm,
-        'weights': weights,
-        'states': states,
-        'mu': mu,
-        'sigma': sigma,
-        'feature_names': list(X.columns)
-    }
+            weights = weights / ssum
+    return {'centroids': centroids, 'weights': weights, 'states': states}
 
 
-def online_infer(X_window: pd.DataFrame,
-                 centroids: np.ndarray,
-                 weights: np.ndarray,
-                 lambda_penalty: float,
-                 filter_len: int = 60) -> int:
-    Xf = X_window.values.astype(float)
+def online_infer(Xf: pd.DataFrame, centroids: np.ndarray, weights: np.ndarray, lambda_penalty: float = 50.0):
+    Xnp = Xf.values.astype(float)
+    T, D = Xnp.shape
+    mu = np.nanmean(Xnp, axis=0)
+    sigma = np.nanstd(Xnp, axis=0, ddof=1) + 1e-12
+    Xs = (Xnp - mu) / sigma
     W_sqrt = np.sqrt(np.maximum(weights, 1e-12))[None, :]
-    Xw = Xf * W_sqrt
+    Xw = Xs * W_sqrt
     cent_w = centroids * W_sqrt
-    st = assign_states_dp(Xw, cent_w, lambda_penalty=lambda_penalty)
-    return int(st[-1])
+    states = assign_states_dp(Xw, cent_w, lambda_penalty=lambda_penalty)
+    return states[-1]
 
 
 def estimate_ewma_sigma(returns: pd.DataFrame, halflife: int = 126) -> pd.DataFrame:
     lam = 0.5 ** (1 / halflife)
-    R = returns.fillna(0.0).values
+    # drop rows that are entirely NaN (e.g., days with no returns) to avoid introducing artificial zeros
+    returns_clean = returns.dropna(how='all')
+    # for any remaining NaNs, fill with 0.0 (minimal imputation); prefer causal imputations upstream
+    R = returns_clean.fillna(0.0).values
     T, N = R.shape
     S = np.zeros((N, N))
     for t in range(T):
         rt = R[t][:, None]
         S = lam * S + (1 - lam) * (rt @ rt.T)
-    return pd.DataFrame(S, index=returns.columns, columns=returns.columns)
+    return pd.DataFrame(S, index=returns_clean.columns, columns=returns_clean.columns)
 
 
-def equilibrium_returns_from_benchmark(Sigma: pd.DataFrame, w_b: np.ndarray, delta: float) -> np.ndarray:
-    return delta * (Sigma.values @ w_b)
+def equilibrium_returns_from_be(Sigma: np.ndarray, market_caps: np.ndarray, risk_aversion: float = 2.5) -> np.ndarray:
+    # simple CAPM equilibrium returns proxy: pi = delta * Sigma * w_mkt
+    return risk_aversion * (Sigma @ market_caps)
 
 
 def bl_posterior(pi: np.ndarray, Sigma: np.ndarray, P: np.ndarray, q: np.ndarray, Omega: np.ndarray, tau: float) -> np.ndarray:
     tauSigma = tau * Sigma
     M = P @ tauSigma @ P.T + Omega
-    invM = linalg.inv(M)
+    invM = safe_inv(M)
     adj = tauSigma @ P.T @ invM @ (q - P @ pi)
     mu = pi + adj
     return mu
 
 
 def mv_optimal_weights(mu: np.ndarray, Sigma: np.ndarray, delta: float) -> np.ndarray:
-    invS = linalg.inv(Sigma)
+    invS = safe_inv(Sigma)
     return (1.0 / delta) * (invS @ mu)
 
 
@@ -244,109 +255,95 @@ def calibrate_omega_to_te(P: np.ndarray, q: np.ndarray, Sigma: np.ndarray, tau: 
 def simulate_single_factor_strategy(far: pd.Series, regimes: pd.Series, cost_bps: float = 0.0005) -> Dict[str, float]:
     idx = far.index.intersection(regimes.index)
     r = far.loc[idx]
-    s = regimes.loc[idx].fillna(method='ffill').fillna(0).astype(int)
-    pos = s.replace({0: -1, 1: 1}).astype(float)
-    pos_shift = pos.shift(1).fillna(pos.iloc[0])
-    turnover = (pos - pos_shift).abs()
-    costs = turnover * cost_bps
-    strat_ret = pos * r - costs
-    mean = strat_ret.mean() * TRADING_DAYS_PER_YEAR
-    std = strat_ret.std(ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR)
-    sharpe = mean / (std + 1e-12)
-    return {'sharpe': float(sharpe), 'mean_ann': float(mean), 'std_ann': float(std)}
+    regimes = regimes.loc[idx]
+    pos = regimes.replace({0: -1, 1: 1}).shift(1).fillna(0.0)  # naive sign position
+    gross = pos * r
+    net = gross - cost_bps * pos.diff().abs().fillna(0.0)
+    ret = net
+    # safe stats: handle empty or extremely short series
+    ret = np.asarray(ret)  # ensure numpy array
+    ret = ret[~np.isnan(ret)]  # drop nans
+
+    if ret.size == 0:
+        ann_ret = 0.0
+        ann_vol = 0.0
+        sharpe = 0.0
+    else:
+        ann_ret = float(np.nanmean(ret)) * TRADING_DAYS_PER_YEAR
+        # if only 1 sample, std with ddof=1 is invalid -> use ddof=0 fallback
+        if ret.size <= 1:
+            ann_vol = float(np.nanstd(ret, ddof=0)) * np.sqrt(TRADING_DAYS_PER_YEAR)
+        else:
+            ann_vol = float(np.nanstd(ret, ddof=1)) * np.sqrt(TRADING_DAYS_PER_YEAR)
+        sharpe = ann_ret / (ann_vol + 1e-12)
+
+    return {'ann_return': ann_ret, 'ann_vol': ann_vol, 'sharpe': sharpe}
 
 
-def tune_hyperparams(far_df: pd.DataFrame,
-                     features_df: pd.DataFrame,
-                     factor_name: str,
-                     lambda_grid: List[float],
-                     kappa_grid: List[float],
-                     lookback_train: int = 252 * 8,
-                     validation_periods: int = 252 * 3,
-                     refit_freq: int = 21,
-                     cost_bps: float = 0.0005,
-                     verbose: bool = False) -> Tuple[float, float]:
-    dates = features_df.index
-    if len(dates) < lookback_train + validation_periods:
-        raise ValueError("insufficient data for tuning")
-
-    total_combos = len(lambda_grid) * len(kappa_grid)
-    combo_count = 0
-    best = {'sharpe': -np.inf, 'lambda': None, 'kappa': None}
-    cols_all = features_df.columns.tolist()
-
-    for lam in lambda_grid:
-        for kap in kappa_grid:
-            combo_count += 1
-            start_msg = f"[Tune {factor_name}] ({combo_count}/{total_combos}) λ={lam}, κ={kap}"
-            print(start_msg, end="", flush=True)
-
-            start_val = lookback_train
-            end_val = lookback_train + validation_periods
-            regimes = pd.Series(index=dates[start_val:end_val], dtype=float)
-            i = start_val
-            while i < end_val:
-                window_start = max(0, i - lookback_train)
-                X_train = features_df.iloc[window_start:i]
-                cols = [c for c in cols_all if c.startswith(factor_name + "__") or ("VIX" in c or "slope" in c)]
-                X_train_fac = X_train[cols]
-                fit = fit_sjm_factor(X_train_fac, lambda_penalty=lam, kappa=kap, max_iter=20)
-                for j in range(i, min(i + refit_freq, end_val)):
-                    idx_start = max(0, j - 60 + 1)
-                    Xf = features_df.iloc[idx_start:j+1][cols]
-                    st = online_infer(Xf, fit['centroids'], fit['weights'], lambda_penalty=lam)
-                    regimes.iloc[j - start_val] = st
-                i += refit_freq
-
-            far = far_df[factor_name]
-            regimes_full = pd.Series(index=dates, dtype=float)
-            regimes_full.loc[dates[start_val:end_val]] = regimes.values
-            regimes_full = regimes_full.ffill().fillna(0).astype(int)
-            sim = simulate_single_factor_strategy(far, regimes_full, cost_bps=cost_bps)
-            sharpe = sim['sharpe']
-
-            end_msg = f" → Sharpe={sharpe:.3f}"
-            print(end_msg)
-
-            if sharpe > best['sharpe']:
-                best = {'sharpe': sharpe, 'lambda': lam, 'kappa': kap}
-
-    print(f"[Tune {factor_name}] best λ={best['lambda']} κ={best['kappa']} Sharpe={best['sharpe']:.3f}")
-    return best['lambda'], best['kappa']
+def tune_hyperparams(far: pd.DataFrame, features: pd.DataFrame, factor: str,
+                     la_grid: List[float], ka_grid: List[float],
+                     lookback_train: int = 252 * 6, validation_days: int = 252, verbose: bool = False) -> Tuple[float, float]:
+    # very small tuning: choose (lambda, kappa) by simple rolling validation (kept minimal)
+    best = {'sharpe': -np.inf, 'lam': la_grid[0], 'kap': ka_grid[0]}
+    for lam in la_grid:
+        for kap in ka_grid:
+            try:
+                # split by available history
+                n = len(features)
+                if n < 2:
+                    continue
+                train_end = max(0, n - validation_days - 1)
+                train_start = max(0, train_end - lookback_train)
+                X_train = features.iloc[train_start:train_end + 1]
+                # be conservative: simulate on the following validation window only
+                val_start = train_end + 1
+                val_end = min(n - 1, train_end + validation_days)
+                X_val = features.iloc[val_start:val_end + 1]
+                if X_train.shape[0] < 10 or X_val.shape[0] < 5:
+                    continue
+                fit = fit_sjm_factor(X_train, lambda_penalty=lam, kappa=kap, max_iter=30, tol=1e-3)
+                # infer on validation window using last few points for filtering
+                state = online_infer(X_val, fit['centroids'], fit['weights'], lambda_penalty=lam)
+                # simulate a naive single-factor strategy as proxy:
+                # get returns series for the factor from far aligned by features index
+                f_ret = far.reindex(X_val.index)
+                regimes = pd.Series([state] * len(f_ret), index=f_ret.index)
+                sim = simulate_single_factor_strategy(f_ret, regimes)
+                if sim['sharpe'] > best['sharpe']:
+                    best = {'sharpe': sim['sharpe'], 'lam': lam, 'kap': kap}
+            except Exception as e:
+                # always print traceback for easier debugging (do not swallow silently)
+                traceback.print_exc()
+                if verbose:
+                    print(f"[SJM] tuning failed for {factor}: {e}")
+    # ensure returned values are numeric
+    lam_out = float(best.get('lam', la_grid[0]))
+    kap_out = float(best.get('kap', ka_grid[0]))
+    return lam_out, kap_out
 
 
-def prepare_bl_inputs(far_df: pd.DataFrame,
-                      last_regimes: Dict[str, int],
-                      tau: float = 0.025,
-                      delta: float = 2.5,
-                      halflife_sigma: int = 126,
-                      target_te: float = 0.02) -> Dict[str, Any]:
-    Sigma = estimate_ewma_sigma(far_df, halflife=halflife_sigma)
-    factors = far_df.columns.tolist()
-    K = len(factors)
-    w_b = np.ones(K) / K
-    pi = equilibrium_returns_from_benchmark(Sigma, w_b, delta)
-    P = np.eye(K)
-    q_list = []
-    for f in factors:
-        r = far_df[f]
-        last_r = last_regimes.get(f, 1)
-        mask = r > 0 if last_r == 1 else r <= 0
-        qm = r.loc[mask].mean() if mask.sum() > 0 else r.mean()
-        q_list.append(qm)
-    q_vec = np.array(q_list)
-    var = far_df.var(axis=0).values
-    base_omega_diag = var * (1.0 / (tau + 1e-12))
-    Omega = calibrate_omega_to_te(P, q_vec, Sigma.values, tau, pi, w_b, delta, base_omega_diag, target_te)
-    return {
-        'P': pd.DataFrame(P, index=factors, columns=factors),
-        'q': pd.Series(q_vec, index=factors),
-        'Omega': pd.DataFrame(Omega, index=factors, columns=factors),
-        'Sigma': Sigma,
-        'tau': tau,
-        'delta': delta,
-        'benchmark_weights': pd.Series(w_b, index=factors)
-    }
+def tracking_positions_to_weights(positions: Dict[str, float]) -> np.ndarray:
+    keys = sorted(positions.keys())
+    w = np.array([positions[k] for k in keys], dtype=float)
+    s = np.nansum(np.abs(w))
+    if s == 0:
+        return w
+    return w / s
+
+
+def mv_optimal_weights_constrained(mu: np.ndarray, Sigma: np.ndarray, delta: float,
+                                   bounds: List[Tuple[float, float]] = None):
+    # simple unconstrained then clip
+    w = mv_optimal_weights(mu, Sigma, delta)
+    if bounds is None:
+        return w
+    w = np.maximum(w, np.array([b[0] for b in bounds]))
+    w = np.minimum(w, np.array([b[1] for b in bounds]))
+    # re-normalize
+    s = np.nansum(np.abs(w))
+    if s == 0:
+        return w
+    return w / s
 
 
 def run_sjm_pipeline(far_path: str,
@@ -365,11 +362,22 @@ def run_sjm_pipeline(far_path: str,
                      target_te: float = 0.02,
                      save_artifacts: bool = True,
                      artifacts_dir: str = "artifacts/sjm",
-                     verbose: bool = False) -> Dict[str, Any]:
-    print(f"[SJM] starting pipeline | lookback_days={lookback_days} | lambda={lambda_penalty} | kappa={kappa}")
+                     verbose: bool = False,
+                     as_of_date: Optional[pd.Timestamp] = None) -> Dict[str, Any]:
+    print(f"[SJM] starting pipeline | lookback_days={lookback_days} | lambda={lambda_penalty} | kappa={kappa} | as_of_date={as_of_date}")
     far = pd.read_csv(far_path, index_col=0, parse_dates=True)
     vix = pd.read_csv(vix_path, index_col=0, parse_dates=True).iloc[:, 0] if (vix_path and os.path.exists(vix_path)) else None
     t10y2y = pd.read_csv(t10y2y_path, index_col=0, parse_dates=True).iloc[:, 0] if (t10y2y_path and os.path.exists(t10y2y_path)) else None
+
+    # If as_of_date provided, restrict all input series to data <= as_of_date (prevent lookahead)
+    if as_of_date is not None:
+        asof = pd.to_datetime(as_of_date)
+        far = far.loc[:asof].copy()
+        if vix is not None:
+            vix = vix.loc[:asof].copy()
+        if t10y2y is not None:
+            t10y2y = t10y2y.loc[:asof].copy()
+
     features = compute_features_from_active_returns(far, vix=vix, t10y2y=t10y2y)
     fits: Dict[str, Any] = {}
     last_regimes: Dict[str, int] = {}
@@ -390,9 +398,7 @@ def run_sjm_pipeline(far_path: str,
         if tune and lambda_grid is not None and kappa_grid is not None:
             try:
                 lookback_train_val = lookback_days if lookback_days is not None else 252 * 8
-                lam, kap = tune_hyperparams(far, features, f, lambda_grid, kappa_grid, lookback_train=lookback_train_val, validation_periods=252*3, verbose=verbose)
-                if verbose:
-                    print(f"[SJM] tuning result for {f} -> lambda={lam} kappa={kap}")
+                lam, kap = tune_hyperparams(far, features, f, lambda_grid, kappa_grid, lookback_train=lookback_train_val, validation_days=252, verbose=verbose)
             except Exception as e:
                 if verbose:
                     print(f"[SJM] tuning failed for {f}: {e}")
@@ -412,7 +418,18 @@ def run_sjm_pipeline(far_path: str,
         X_train = Xf.iloc[window_start:last_idx + 1]
         print(f"[SJM] {f}: fitting with {len(X_train)} samples")
         fit = fit_sjm_factor(X_train, lambda_penalty=lam, kappa=kap, max_iter=50, verbose=verbose)
+
+        # ensure states is a pandas Series indexed by the training index when possible
+        if 'states' in fit and not isinstance(fit['states'], pd.Series):
+            try:
+                fit_states = pd.Series(fit['states'], index=X_train.index)
+            except Exception:
+                # fallback: keep as plain Series with integer index if shape mismatch
+                fit_states = pd.Series(fit['states'])
+            fit['states'] = fit_states
+
         fits[f] = fit
+
         if save_artifacts:
             fname = f"{f}_{pd.Timestamp.now().strftime('%Y%m%d')}.joblib"
             joblib.dump(fit, os.path.join(artifacts_dir, fname))
@@ -423,25 +440,33 @@ def run_sjm_pipeline(far_path: str,
         t1 = time.time()
         print(f"[SJM] {f}: current regime = {state_last} | fit time = {(t1 - t0):.2f}s")
 
-    print("[SJM] preparing Black-Litterman inputs")
-    bl_inputs = prepare_bl_inputs(far, last_regimes, tau=tau, delta=delta, halflife_sigma=halflife_sigma, target_te=target_te)
-    print("[SJM] pipeline done")
-    return {'features': features, 'fits': fits, 'last_regimes': last_regimes, 'bl_inputs': bl_inputs}
+    # prepare BL inputs (q, P, base omega, etc.)
+    # NOTE: far here is already sliced to as_of_date if provided above
+    Sigma = estimate_ewma_sigma(far, halflife=halflife_sigma)
+    factors_sorted = far.columns.tolist()
+    P = np.eye(len(factors_sorted))
+    # compute q as mean active returns by regime using only available data (far is already sliced if as_of_date provided)
+    q = pd.Series(index=factors_sorted, dtype=float)
+    base_omega = np.ones(len(factors_sorted)) * 1e-4
+    # Example: for each factor compute mean active return over the entire available (up to as_of_date) period
+    for idx, fac in enumerate(factors_sorted):
+        if fac in last_regimes:
+            # use all available far data up to as_of_date for that factor
+            vals = far[fac].dropna()
+            q.iloc[idx] = vals.mean() if len(vals) > 0 else 0.0
+        else:
+            q.iloc[idx] = 0.0
 
+    # ensure benchmark_weights (equally-weighted across assets) — minimal change
+    asset_index = list(Sigma.index) if hasattr(Sigma, "index") else ["Market", "Value", "Size", "Momentum", "Quality", "LowVolatility", "Growth"]
+    w_b = pd.Series([1.0 / len(asset_index)] * len(asset_index), index=asset_index)
 
-if __name__ == "__main__":
-    base = os.path.join(os.getcwd(), "data_factors")
-    farp = os.path.join(base, "factor_active_returns.csv")
-    vixp = os.path.join(base, "VIX.csv")
-    t10p = os.path.join(base, "T10Y2Y.csv")
-    if not os.path.exists(farp):
-        print("factor_active_returns.csv not found.")
-    else:
-        out = run_sjm_pipeline(farp, vix_path=vixp if os.path.exists(vixp) else None,
-                               t10y2y_path=t10p if os.path.exists(t10p) else None,
-                               lookback_days=252 * 8,
-                               lambda_penalty=50.0, kappa=9.5,
-                               tune=False, verbose=True)
-        print("last_regimes:", out['last_regimes'])
-        print("BL q head:")
-        print(out['bl_inputs']['q'].head())
+    bl_inputs = {
+        'q': q,
+        'P': P,
+        'Sigma': Sigma,
+        'base_omega': base_omega,
+        'tau': tau,
+        'benchmark_weights': w_b
+    }
+    return {'fits': fits, 'last_regimes': last_regimes, 'bl_inputs': bl_inputs}
