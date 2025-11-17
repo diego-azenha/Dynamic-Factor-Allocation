@@ -269,15 +269,20 @@ def run_backtest():
     bmk_w = pd.Series(np.ones(len(benchmark_assets)) / len(benchmark_assets), index=benchmark_assets)
     benchmark_daily = (df_returns[benchmark_assets] * bmk_w).sum(axis=1)
 
-    # NAVs
+    # --- slice returns to out-of-sample period first (TEST_START) ---
+    strat_daily = strat_daily.loc[strat_daily.index >= pd.to_datetime(TEST_START)]
+    benchmark_daily = benchmark_daily.loc[benchmark_daily.index >= pd.to_datetime(TEST_START)]
+
+    # --- NAVs (cumulative) built from the sliced returns ---
     nav_strat = (1.0 + strat_daily).cumprod()
     nav_bmk = (1.0 + benchmark_daily).cumprod()
 
-    # cortar para começar em TEST_START (validação)
-    nav_strat = nav_strat[nav_strat.index >= pd.to_datetime(TEST_START)]
-    nav_bmk = nav_bmk[nav_bmk.index >= pd.to_datetime(TEST_START)]
-    strat_daily = strat_daily[strat_daily.index >= pd.to_datetime(TEST_START)]
-    benchmark_daily = benchmark_daily[benchmark_daily.index >= pd.to_datetime(TEST_START)]
+    # --- ensure NAV starts at 1.0 at TEST_START (defensive) ---
+    if not nav_strat.empty and nav_strat.iloc[0] != 0:
+        nav_strat = nav_strat / float(nav_strat.iloc[0])
+    if not nav_bmk.empty and nav_bmk.iloc[0] != 0:
+        nav_bmk = nav_bmk / float(nav_bmk.iloc[0])
+
 
     # métricas (somente out-of-sample)
     metrics_strat = compute_metrics(strat_daily)
